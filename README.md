@@ -292,7 +292,7 @@ Hit Execute on Flow 1. Check Telegram. If a message arrives, all 3 flows will ru
 
 ## Cost
 
-~$0.05/week at current Anthropic pricing. A small VPS to self-host Kestra (~$5/month) is the main cost.
+$0.05/week at current Anthropic pricing. A small VPS to self-host Kestra ($5/month) is the main cost.
 
 ---
 

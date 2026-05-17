@@ -1,0 +1,113 @@
+id: intake-morning-digest
+namespace: intake
+
+tasks:
+  - id: fetch_jobs
+    type: io.kestra.plugin.core.http.Request
+    uri: "https://api.adzuna.com/v1/api/jobs/us/search/1?app_id={{ kv('ADZUNA_APP_ID') }}&app_key={{ kv('ADZUNA_APP_KEY') }}&results_per_page=5&what=software+engineer&where=chicago&content-type=application/json"
+    method: GET
+
+  - id: score_jobs
+    type: io.kestra.plugin.scripts.python.Script
+    inputFiles:
+      jobs.json: "{{ outputs.fetch_jobs.body }}"
+    script: |
+      import json, urllib.request
+
+      with open("jobs.json") as f:
+          data = json.load(f)
+
+      jobs = data.get("results", [])[:3]
+      scored = []
+
+      resume = "Python/React software engineer, healthcare AI, RAG, FastAPI, PostgreSQL, IIT Chicago grad student"
+
+      for job in jobs:
+          title = job.get("title", "")
+          company = job.get("company", {}).get("display_name", "")
+          desc = job.get("description", "")[:300]
+          url = job.get("redirect_url", "")
+
+          prompt = "Score this job 1-10 for: " + resume + "\nJob: " + title + " at " + company + "\nDesc: " + desc + "\nReturn ONLY JSON: {\"score\": 8, \"reason\": \"one sentence\", \"missing\": [\"skill1\"]}"
+
+          payload = json.dumps({
+              "model": "claude-sonnet-4-20250514",
+              "max_tokens": 150,
+              "messages": [{"role": "user", "content": prompt}]
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=payload,
+              headers={
+                  "x-api-key": "{{ kv('ANTHROPIC_API_KEY') }}",
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json"
+              }
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                  result = json.loads(resp.read())
+                  text = result["content"][0]["text"].strip()
+                  text = text.replace("```json","").replace("```","").strip()
+                  analysis = json.loads(text)
+                  scored.append({
+                      "title": title,
+                      "company": company,
+                      "url": url,
+                      "score": analysis.get("score", 0),
+                      "reason": analysis.get("reason", ""),
+                      "missing": analysis.get("missing", [])
+                  })
+          except Exception as e:
+              print("Error: " + str(e))
+
+      top = sorted(scored, key=lambda x: x["score"], reverse=True)
+      with open("top.json", "w") as f:
+          json.dump(top, f)
+      print(json.dumps(top, indent=2))
+    outputFiles:
+      - top.json
+
+  - id: send_telegram
+    type: io.kestra.plugin.scripts.python.Script
+    inputFiles:
+      top.json: "{{ outputs.score_jobs.outputFiles['top.json'] }}"
+    script: |
+      import json, urllib.request
+      from datetime import datetime
+
+      with open("top.json") as f:
+          jobs = json.load(f)
+
+      if not jobs:
+          print("No jobs to send")
+      else:
+          msg = "Intake Daily Digest - " + datetime.now().strftime("%b %d") + "\n\n"
+          for j in jobs:
+              msg += "Score: " + str(j["score"]) + "/10 - " + j["title"] + " at " + j["company"] + "\n"
+              msg += "Why: " + j["reason"] + "\n"
+              msg += "Missing: " + ", ".join(j["missing"][:2]) + "\n"
+              msg += "Link: " + j["url"] + "\n\n"
+
+          payload = json.dumps({
+              "chat_id": "{{ kv('TELEGRAM_CHAT_ID') }}",
+              "text": msg
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://api.telegram.org/bot{{ kv('TELEGRAM_TOKEN') }}/sendMessage",
+              data=payload,
+              headers={"content-type": "application/json"}
+          )
+          with urllib.request.urlopen(req) as resp:
+              print("Sent! " + str(resp.status))
+
+  - id: log_run
+    type: io.kestra.plugin.core.log.Log
+    message: "Flow 1 done at {{ now() }}"
+
+triggers:
+  - id: daily_8am
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 8 * * *"

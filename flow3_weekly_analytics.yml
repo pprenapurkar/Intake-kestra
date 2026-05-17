@@ -1,0 +1,144 @@
+id: intake-weekly-analytics
+namespace: intake
+
+tasks:
+  - id: compute_metrics
+    type: io.kestra.plugin.scripts.python.Script
+    script: |
+      import json
+
+      metrics = {
+          "total_applications": 23,
+          "applied_this_week": 8,
+          "response_rate_pct": 26,
+          "interview_count": 2,
+          "offer_count": 0,
+          "ghosted_count": 4,
+          "status_breakdown": {
+              "applied": 14,
+              "phone_screen": 5,
+              "interview": 2,
+              "rejected": 2
+          },
+          "top_missing_skills": ["Go", "Kubernetes", "Java"]
+      }
+
+      with open("metrics.json", "w") as f:
+          json.dump(metrics, f)
+      print(json.dumps(metrics, indent=2))
+    outputFiles:
+      - metrics.json
+
+  - id: analyze_with_claude
+    type: io.kestra.plugin.scripts.python.Script
+    inputFiles:
+      metrics.json: "{{ outputs.compute_metrics.outputFiles['metrics.json'] }}"
+    script: |
+      import json, urllib.request
+
+      with open("metrics.json") as f:
+          metrics = json.load(f)
+
+      prompt = "Analyze this job search pipeline and give advice. Metrics: " + json.dumps(metrics) + " Return ONLY JSON with these keys: health_score (int 1-10), headline (string), top_insight (string), action_item (string), encouragement (string). No markdown, no explanation."
+
+      payload = json.dumps({
+          "model": "claude-sonnet-4-20250514",
+          "max_tokens": 200,
+          "messages": [{"role": "user", "content": prompt}]
+      }).encode()
+
+      req = urllib.request.Request(
+          "https://api.anthropic.com/v1/messages",
+          data=payload,
+          headers={
+              "x-api-key": "{{ kv('ANTHROPIC_API_KEY') }}",
+              "anthropic-version": "2023-06-01",
+              "content-type": "application/json"
+          }
+      )
+      with urllib.request.urlopen(req, timeout=20) as resp:
+          result = json.loads(resp.read())
+          text = result["content"][0]["text"].strip()
+          text = text.replace("```json","").replace("```","").strip()
+          analysis = json.loads(text)
+
+      with open("analysis.json", "w") as f:
+          json.dump(analysis, f)
+      print(json.dumps(analysis, indent=2))
+    outputFiles:
+      - analysis.json
+
+  - id: build_digest
+    type: io.kestra.plugin.scripts.python.Script
+    inputFiles:
+      metrics.json: "{{ outputs.compute_metrics.outputFiles['metrics.json'] }}"
+      analysis.json: "{{ outputs.analyze_with_claude.outputFiles['analysis.json'] }}"
+    script: |
+      import json
+      from datetime import datetime
+
+      with open("metrics.json") as f:
+          m = json.load(f)
+      with open("analysis.json") as f:
+          a = json.load(f)
+
+      health = a.get("health_score", 7)
+      bar = "🟢" if health >= 7 else "🟡" if health >= 4 else "🔴"
+
+      digest = "Intake Weekly Report - " + datetime.now().strftime("%b %d") + "\n\n"
+      digest += bar + " Pipeline Health: " + str(health) + "/10\n"
+      digest += a.get("headline", "") + "\n\n"
+      digest += "This Week:\n"
+      digest += "Applied: " + str(m["applied_this_week"]) + " new roles\n"
+      digest += "Total: " + str(m["total_applications"]) + " applications\n"
+      digest += "Response rate: " + str(m["response_rate_pct"]) + "%\n"
+      digest += "Interviews: " + str(m["interview_count"]) + "\n"
+      digest += "Ghosted: " + str(m["ghosted_count"]) + "\n\n"
+      digest += "AI Insight: " + a.get("top_insight", "") + "\n"
+      digest += "Action: " + a.get("action_item", "") + "\n"
+      digest += a.get("encouragement", "")
+
+      with open("digest.txt", "w") as f:
+          f.write(digest)
+      print(digest)
+    outputFiles:
+      - digest.txt
+
+  - id: human_review
+    type: io.kestra.plugin.core.flow.Pause
+    onResume:
+      - id: approved
+        type: BOOLEAN
+        defaults: "true"
+
+  - id: send_digest
+    type: io.kestra.plugin.scripts.python.Script
+    inputFiles:
+      digest.txt: "{{ outputs.build_digest.outputFiles['digest.txt'] }}"
+    script: |
+      import urllib.request, json
+
+      with open("digest.txt") as f:
+          text = f.read()
+
+      payload = json.dumps({
+          "chat_id": "{{ kv('TELEGRAM_CHAT_ID') }}",
+          "text": text
+      }).encode()
+
+      req = urllib.request.Request(
+          "https://api.telegram.org/bot{{ kv('TELEGRAM_TOKEN') }}/sendMessage",
+          data=payload,
+          headers={"content-type": "application/json"}
+      )
+      with urllib.request.urlopen(req) as resp:
+          print("Sent! " + str(resp.status))
+
+  - id: log_run
+    type: io.kestra.plugin.core.log.Log
+    message: "Flow 3 done at {{ now() }}"
+
+triggers:
+  - id: weekly_sunday
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 * * 0"

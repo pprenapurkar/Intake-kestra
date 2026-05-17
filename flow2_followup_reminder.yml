@@ -1,0 +1,134 @@
+id: intake-followup-reminder
+namespace: intake
+
+tasks:
+  - id: check_applications
+    type: io.kestra.plugin.scripts.python.Script
+    script: |
+      import json
+      from datetime import datetime
+
+      apps = [
+        {"company": "Tempus AI", "role": "Software Engineer", "status": "applied", "days_ago": 9},
+        {"company": "Accenture", "role": "Backend Engineer", "status": "phone_screen", "days_ago": 5},
+        {"company": "Google", "role": "Software Engineer", "status": "applied", "days_ago": 16}
+      ]
+
+      overdue = []
+      for app in apps:
+          if app["status"] == "applied" and app["days_ago"] >= 14:
+              app["action"] = "ghosted"
+              overdue.append(app)
+          elif app["status"] == "applied" and app["days_ago"] >= 7:
+              app["action"] = "standard_followup"
+              overdue.append(app)
+          elif app["status"] == "phone_screen" and app["days_ago"] >= 5:
+              app["action"] = "phone_screen"
+              overdue.append(app)
+
+      with open("overdue.json", "w") as f:
+          json.dump(overdue, f)
+      print("Overdue: " + str(len(overdue)))
+    outputFiles:
+      - overdue.json
+
+  - id: draft_messages
+    type: io.kestra.plugin.scripts.python.Script
+    inputFiles:
+      overdue.json: "{{ outputs.check_applications.outputFiles['overdue.json'] }}"
+    script: |
+      import json, urllib.request
+
+      with open("overdue.json") as f:
+          apps = json.load(f)
+
+      messages = []
+      for app in apps:
+          action = app.get("action", "standard_followup")
+          company = app["company"]
+          role = app["role"]
+          days = str(app["days_ago"])
+
+          if action == "ghosted":
+              prompt = "Write a 2-sentence final follow-up email for " + role + " at " + company + ", applied " + days + " days ago, no response. Be polite and leave the door open."
+          elif action == "phone_screen":
+              prompt = "Write a 2-sentence thank-you follow-up for " + role + " at " + company + " after a phone screen " + days + " days ago."
+          else:
+              prompt = "Write a 2-sentence follow-up email for " + role + " at " + company + ", applied " + days + " days ago. Professional and warm."
+
+          payload = json.dumps({
+              "model": "claude-sonnet-4-20250514",
+              "max_tokens": 120,
+              "messages": [{"role": "user", "content": prompt}]
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=payload,
+              headers={
+                  "x-api-key": "{{ kv('ANTHROPIC_API_KEY') }}",
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json"
+              }
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                  result = json.loads(resp.read())
+                  draft = result["content"][0]["text"].strip()
+                  messages.append({
+                      "company": company,
+                      "role": role,
+                      "days": app["days_ago"],
+                      "action": action,
+                      "draft": draft
+                  })
+          except Exception as e:
+              print("Error: " + str(e))
+
+      with open("messages.json", "w") as f:
+          json.dump(messages, f)
+      print("Drafted: " + str(len(messages)))
+    outputFiles:
+      - messages.json
+
+  - id: send_reminders
+    type: io.kestra.plugin.scripts.python.Script
+    inputFiles:
+      messages.json: "{{ outputs.draft_messages.outputFiles['messages.json'] }}"
+    script: |
+      import json, urllib.request
+
+      with open("messages.json") as f:
+          messages = json.load(f)
+
+      if not messages:
+          print("No reminders needed")
+      else:
+          action_emoji = {"ghosted": "👻", "phone_screen": "📞", "standard_followup": "⏰"}
+          text = "Intake Follow-up Reminders\n\n"
+          for m in messages:
+              emoji = action_emoji.get(m["action"], "⏰")
+              text += emoji + " " + m["company"] + " - " + m["role"] + " (" + str(m["days"]) + " days ago)\n"
+              text += "Draft: " + m["draft"] + "\n\n"
+
+          payload = json.dumps({
+              "chat_id": "{{ kv('TELEGRAM_CHAT_ID') }}",
+              "text": text
+          }).encode()
+
+          req = urllib.request.Request(
+              "https://api.telegram.org/bot{{ kv('TELEGRAM_TOKEN') }}/sendMessage",
+              data=payload,
+              headers={"content-type": "application/json"}
+          )
+          with urllib.request.urlopen(req) as resp:
+              print("Sent! " + str(resp.status))
+
+  - id: log_run
+    type: io.kestra.plugin.core.log.Log
+    message: "Flow 2 done at {{ now() }}"
+
+triggers:
+  - id: daily_6pm
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 18 * * *"
